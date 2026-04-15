@@ -33,24 +33,6 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: 'No payment id' }), { status: 400 });
     }
 
-    // Idempotency check: se este evento para este pagamento já foi processado, ignora
-    const { count: existingCount } = await supabase
-      .from('payments_logs')
-      .select('id', { count: 'exact', head: true })
-      .eq('event', event)
-      .filter('payload->payment->>id', 'eq', asaasPaymentId);
-
-    if ((existingCount ?? 0) > 0) {
-      console.log(`[Asaas Webhook] Duplicate event ${event} for ${asaasPaymentId} — ignoring.`);
-      return new Response(JSON.stringify({ message: 'Already processed' }), {
-        status: 200,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Registra log do evento (primeira ocorrência)
-    await supabase.from('payments_logs').insert([{ event, payload: body }]);
-
     // Map Asaas event to our status
     const statusMap: Record<string, string> = {
       PAYMENT_CREATED: 'pendente',
@@ -68,21 +50,54 @@ serve(async (req) => {
           : new Date().toISOString())
       : null;
 
-    // Update donation
-    const { data: updated, error } = await supabase
+    // Verifica o estado atual da doação no banco para idempotência correta
+    const { data: existingDonation } = await supabase
       .from('donations')
-      .update({ status: newStatus, confirmed_at: confirmedAt })
+      .select('id, status, confirmed_at')
       .eq('asaas_payment_id', asaasPaymentId)
-      .select();
+      .maybeSingle();
 
-    if (error) throw error;
+    // Retorna cedo SÓ se a doação já está no estado final correto
+    // Isso permite que retries consigam auto-registrar doações que falharam antes
+    const alreadyInFinalState = existingDonation && (
+      (newStatus === 'pago' && existingDonation.status === 'pago' && existingDonation.confirmed_at) ||
+      (newStatus === 'cancelado' && existingDonation.status === 'cancelado')
+    );
 
-    let affectedRows = updated?.length || 0;
+    if (alreadyInFinalState) {
+      console.log(`[Asaas Webhook] ${event} for ${asaasPaymentId} already in final state — ignoring.`);
+      return new Response(JSON.stringify({ message: 'Already processed' }), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
 
-    // Se nao achou no banco, foi gerada fora do sistema (ex: portal asaas) -> auto-registro!
-    if (affectedRows === 0 && payment) {
+    // Registra log sem duplicatas (dedup por event + payment_id)
+    const { count: logCount } = await supabase
+      .from('payments_logs')
+      .select('id', { count: 'exact', head: true })
+      .eq('event', event)
+      .filter('payload->payment->>id', 'eq', asaasPaymentId);
+
+    if ((logCount ?? 0) === 0) {
+      await supabase.from('payments_logs').insert([{ event, payload: body }]);
+    }
+
+    let affectedRows = 0;
+
+    if (existingDonation) {
+      // Doação existe mas ainda não está no estado final — atualiza
+      const { data: updated, error } = await supabase
+        .from('donations')
+        .update({ status: newStatus, confirmed_at: confirmedAt })
+        .eq('asaas_payment_id', asaasPaymentId)
+        .select();
+      if (error) throw error;
+      affectedRows = updated?.length || 0;
+      console.log(`[Asaas Webhook] ${event} → donation updated:`, updated);
+    } else {
+      // Doação não existe — auto-registro (pagamento criado fora do sistema)
       console.log(`[Asaas Webhook] Payment ${asaasPaymentId} not found. Auto-registering...`);
-      // Tenta achar o doador pelo customer_id do asaas
       let donorId = null;
       if (payment.customer) {
         const { data: donor } = await supabase.from('donors').select('id').eq('asaas_customer_id', payment.customer).maybeSingle();
@@ -107,8 +122,6 @@ serve(async (req) => {
       if (insertErr) throw insertErr;
       console.log(`[Asaas Webhook] Auto-registered external donation:`, newDonation);
       affectedRows = newDonation ? newDonation.length : 1;
-    } else {
-      console.log(`[Asaas Webhook] ${event} → donation updated:`, updated);
     }
 
     return new Response(JSON.stringify({ success: true, updated: affectedRows }), {

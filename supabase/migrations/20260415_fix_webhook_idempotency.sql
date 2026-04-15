@@ -4,7 +4,13 @@
 -- ============================================================
 
 -- ──────────────────────────────────────────────────────────────
--- PASSO 1: Remover logs duplicados — mantém apenas o primeiro
+-- PASSO 1: Garantir que donation_date existe com default
+-- ──────────────────────────────────────────────────────────────
+ALTER TABLE donations ADD COLUMN IF NOT EXISTS donation_date timestamptz DEFAULT now();
+UPDATE donations SET donation_date = now() WHERE donation_date IS NULL;
+
+-- ──────────────────────────────────────────────────────────────
+-- PASSO 2: Remover logs duplicados — mantém apenas o primeiro
 -- registro de cada combinação event + payment_id
 -- ──────────────────────────────────────────────────────────────
 DELETE FROM payments_logs
@@ -24,17 +30,65 @@ WHERE id IN (
 );
 
 -- ──────────────────────────────────────────────────────────────
--- PASSO 2: Corrigir confirmed_at nas doações que ficaram com
--- o timestamp do retry em vez da data real de confirmação.
--- Usa o created_at do PRIMEIRO log RECEIVED/CONFIRMED para
--- cada payment_id como referência mais próxima da confirmação real.
+-- PASSO 3: Reconciliar — inserir doações que estão nos logs
+-- de webhook (RECEIVED/CONFIRMED) mas NÃO estão na tabela donations
+-- Isso corrige o segundo PIX (pay_orfs8m7xftt312xz) e qualquer outro
+-- pagamento externo que falhou no auto-registro
+-- ──────────────────────────────────────────────────────────────
+INSERT INTO donations (
+  asaas_payment_id,
+  donor_id,
+  amount,
+  status,
+  billing_type,
+  donation_date,
+  confirmed_at
+)
+SELECT DISTINCT ON (pl.payload->'payment'->>'id')
+  pl.payload->'payment'->>'id'                                              AS asaas_payment_id,
+  (
+    SELECT id FROM donors
+    WHERE asaas_customer_id = pl.payload->'payment'->>'customer'
+    LIMIT 1
+  )                                                                         AS donor_id,
+  (pl.payload->'payment'->>'value')::numeric                                AS amount,
+  'pago'                                                                    AS status,
+  COALESCE(
+    NULLIF(pl.payload->'payment'->>'billingType', ''),
+    'PIX'
+  )                                                                         AS billing_type,
+  COALESCE(
+    NULLIF(pl.payload->'payment'->>'confirmedDate', '')::timestamptz,
+    NULLIF(pl.payload->'payment'->>'dateCreated', '')::timestamptz,
+    pl.created_at
+  )                                                                         AS donation_date,
+  COALESCE(
+    NULLIF(pl.payload->'payment'->>'confirmedDate', '')::timestamptz,
+    pl.created_at
+  )                                                                         AS confirmed_at
+FROM payments_logs pl
+WHERE pl.event IN ('PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED')
+  AND pl.payload->'payment'->>'id' IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM donations d
+    WHERE d.asaas_payment_id = pl.payload->'payment'->>'id'
+  )
+ORDER BY pl.payload->'payment'->>'id', pl.created_at ASC;
+
+-- ──────────────────────────────────────────────────────────────
+-- PASSO 4: Atualizar confirmed_at nas doações existentes que
+-- estão como 'pago' mas sem confirmed_at (dados históricos)
 -- ──────────────────────────────────────────────────────────────
 UPDATE donations d
-SET confirmed_at = pl.created_at
+SET confirmed_at = COALESCE(
+    NULLIF(pl.payload->'payment'->>'confirmedDate', '')::timestamptz,
+    pl.created_at
+  )
 FROM (
   SELECT DISTINCT ON (payload->'payment'->>'id')
-    payload->'payment'->>'id' AS payment_id,
-    created_at
+    payload->'payment'->>'id'  AS payment_id,
+    created_at,
+    payload
   FROM payments_logs
   WHERE event IN ('PAYMENT_RECEIVED', 'PAYMENT_CONFIRMED')
     AND payload->'payment'->>'id' IS NOT NULL
@@ -42,31 +96,34 @@ FROM (
 ) pl
 WHERE d.asaas_payment_id = pl.payment_id
   AND d.status = 'pago'
-  -- Só atualiza se confirmed_at está muito longe da data real
-  -- (diferença > 1 hora indica que foi salvo por um retry tardio)
-  AND (d.confirmed_at IS NULL OR ABS(EXTRACT(EPOCH FROM (d.confirmed_at - pl.created_at))) > 3600);
+  AND d.confirmed_at IS NULL;
 
 -- ──────────────────────────────────────────────────────────────
--- PASSO 3: Verificação — mostra o estado após a correção
+-- PASSO 5: Verificação — mostre o estado após a correção
 -- ──────────────────────────────────────────────────────────────
 SELECT
-  'Logs únicos por payment_id + event' AS label,
-  COUNT(*) AS total
-FROM payments_logs
-WHERE payload->'payment'->>'id' IS NOT NULL;
+  'Total doações Asaas' AS label,
+  COUNT(*) AS total,
+  SUM(amount) AS total_amount
+FROM donations
+WHERE asaas_payment_id IS NOT NULL;
 
 SELECT
-  'Doações confirmadas' AS label,
+  'Confirmadas' AS label,
   COUNT(*) AS total,
   SUM(amount) AS total_amount
 FROM donations
 WHERE asaas_payment_id IS NOT NULL AND status = 'pago';
 
 SELECT
-  'Confirmadas hoje (UTC-3 / Brasília)' AS label,
-  COUNT(*) AS total,
-  SUM(amount) AS total_amount
+  id,
+  asaas_payment_id,
+  amount,
+  status,
+  billing_type,
+  donation_date,
+  confirmed_at
 FROM donations
 WHERE asaas_payment_id IS NOT NULL
-  AND status = 'pago'
-  AND (confirmed_at AT TIME ZONE 'America/Sao_Paulo')::date = (NOW() AT TIME ZONE 'America/Sao_Paulo')::date;
+ORDER BY donation_date DESC NULLS LAST
+LIMIT 10;
